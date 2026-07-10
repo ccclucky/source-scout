@@ -1,0 +1,9 @@
+{
+  "name": "authoritative-source-discovery",
+  "description": "Discover and organize official or directly referenced web sources while reducing irrelevant noise.",
+  "version": "0.1.0",
+  "author": {
+    "name": "ccclucky"
+  },
+  "repository": "https://github.com/ccclucky/authoritative-source-discovery"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "authoritative-source-discovery",
+  "version": "0.1.0",
+  "description": "Discover and organize official or directly referenced web sources while reducing irrelevant noise.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Authoritative Source Discovery",
+    "shortDescription": "Discover and classify authoritative web sources.",
+    "longDescription": "Find official and directly referenced sources from a seed URL, reduce noise with bounded LLM review, and export an auditable URL collection."
+  }
+}

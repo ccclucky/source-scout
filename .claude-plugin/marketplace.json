@@ -1,0 +1,13 @@
+{
+  "name": "authoritative-source-tools",
+  "owner": {
+    "name": "ccclucky"
+  },
+  "plugins": [
+    {
+      "name": "authoritative-source-discovery",
+      "source": "./plugins/authoritative-source-discovery",
+      "description": "Discover and organize official or directly referenced web sources while reducing irrelevant noise."
+    }
+  ]
+}
