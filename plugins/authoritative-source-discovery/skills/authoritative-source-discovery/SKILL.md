@@ -68,7 +68,7 @@ All modes use the same cleanup and acceptance policy. Fast still applies determi
    python scripts/discover.py classify group-submit --run-dir <RUN_DIR> --input group-decision.json
    ```
 
-   The script applies the rule only when all proposal and validation samples agree. A counterexample records `validation_failed` and leaves the candidates uncertain. Narrow a failed group once by passing `--parent-rule-id <FAILED_RULE_ID>` to `group-next`; a second split is rejected.
+   The script applies the rule only when all proposal and validation samples agree on decision and category. A counterexample records `validation_failed` and leaves the candidates uncertain. To split a failed group, call `group-next` with only `--run-dir` and `--parent-rule-id <FAILED_RULE_ID>`; the script chooses one narrower subgroup by path first, then provenance, then page region. Each failed parent permits only one split attempt, and a failed subgroup cannot be split again.
 
    User overrides use:
 

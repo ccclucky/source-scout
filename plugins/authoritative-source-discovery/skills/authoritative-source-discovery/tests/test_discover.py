@@ -38,7 +38,7 @@ class FixtureSite:
                         self.end_headers()
                         return
                     extra = "".join(
-                        f"<url><loc>{outer.origin}/docs/generated-{index}</loc></url>"
+                        f"<url><loc>{outer.origin}/docs/api/group-{index % 3}/generated-{index}</loc></url>"
                         for index in range(outer.extra_sitemap_count)
                     )
                     if outer.blocked_sitemap:
@@ -166,7 +166,7 @@ class DiscoverCliTests(unittest.TestCase):
 
             result = run_cli(
                 "classify", "group-next", "--run-dir", run_dir,
-                "--field", "path", "--operator", "prefix", "--value", "/docs/generated-",
+                "--field", "path", "--operator", "prefix", "--value", "/docs/api/",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
@@ -176,8 +176,10 @@ class DiscoverCliTests(unittest.TestCase):
             proposal_ids = {item["id"] for item in payload["proposal_items"]}
             validation_ids = {item["id"] for item in payload["validation_items"]}
             self.assertTrue(proposal_ids.isdisjoint(validation_ids))
+            self.assertEqual({item["url"].split("/docs/api/", 1)[1].split("/", 1)[0] for item in payload["proposal_items"]}, {"group-0", "group-1", "group-2"})
+            self.assertEqual({item["url"].split("/docs/api/", 1)[1].split("/", 1)[0] for item in payload["validation_items"]}, {"group-0", "group-1", "group-2"})
             self.assertEqual(payload["condition"], {
-                "field": "path", "operator": "prefix", "value": "/docs/generated-",
+                "field": "path", "operator": "prefix", "value": "/docs/api/",
             })
 
     def test_group_submit_applies_unanimously_validated_rule_and_preserves_history(self):
@@ -187,7 +189,7 @@ class DiscoverCliTests(unittest.TestCase):
             classify_all_as_uncertain(run_dir)
             planned = run_cli(
                 "classify", "group-next", "--run-dir", run_dir,
-                "--field", "path", "--operator", "prefix", "--value", "/docs/generated-",
+                "--field", "path", "--operator", "prefix", "--value", "/docs/api/",
             )
             plan = json.loads(planned.stdout)
             samples = plan["proposal_items"] + plan["validation_items"]
@@ -195,7 +197,7 @@ class DiscoverCliTests(unittest.TestCase):
                 "rule_id": plan["rule_id"], "decision": "include", "category": "reference",
                 "reason": "generated API reference pages are in scope",
                 "sample_decisions": [{
-                    "id": item["id"], "decision": "include", "confidence": "high",
+                    "id": item["id"], "decision": "include", "category": "reference", "confidence": "high",
                     "reason": "in-scope generated API reference",
                 } for item in samples],
             }
@@ -206,7 +208,7 @@ class DiscoverCliTests(unittest.TestCase):
             self.assertEqual(submitted.returncode, 0, submitted.stderr)
             self.assertEqual(json.loads(submitted.stdout)["applied"], 60)
             state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
-            generated = [item for item in state["candidates"] if "/docs/generated-" in item["url"]]
+            generated = [item for item in state["candidates"] if "/generated-" in item["url"]]
             self.assertEqual({item["decision"] for item in generated}, {"include"})
             self.assertEqual({item["decision_basis"] for item in generated}, {"rule"})
             self.assertTrue(all([entry["basis"] for entry in item["decision_history"]] == ["model", "rule"] for item in generated))
@@ -217,11 +219,10 @@ class DiscoverCliTests(unittest.TestCase):
             run_dir = Path(json.loads(started.stdout)["run_dir"])
             classify_all_as_uncertain(run_dir)
 
-            def plan(value, parent=None):
-                args = [
-                    "classify", "group-next", "--run-dir", run_dir,
-                    "--field", "path", "--operator", "contains", "--value", value,
-                ]
+            def plan(value=None, parent=None):
+                args = ["classify", "group-next", "--run-dir", run_dir]
+                if value:
+                    args.extend(["--field", "path", "--operator", "prefix", "--value", value])
                 if parent:
                     args.extend(["--parent-rule-id", parent])
                 result = run_cli(*args)
@@ -231,7 +232,7 @@ class DiscoverCliTests(unittest.TestCase):
             def reject(group_plan):
                 samples = group_plan["proposal_items"] + group_plan["validation_items"]
                 rows = [{
-                    "id": item["id"], "decision": "include", "confidence": "high", "reason": "mostly in scope",
+                    "id": item["id"], "decision": "include", "category": "reference", "confidence": "high", "reason": "mostly in scope",
                 } for item in samples]
                 rows[-1]["decision"] = "exclude"
                 rows[-1]["reason"] = "counterexample"
@@ -244,22 +245,22 @@ class DiscoverCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["status"], "validation_failed")
 
-            broad = plan("/docs/generated-")
+            broad = plan("/docs/api/")
             reject(broad)
             state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
-            generated = [item for item in state["candidates"] if "/docs/generated-" in item["url"]]
+            generated = [item for item in state["candidates"] if "/generated-" in item["url"]]
             self.assertEqual({item["decision"] for item in generated}, {"uncertain"})
 
-            subgroup = plan("/docs/generated-1", broad["rule_id"])
+            subgroup = plan(parent=broad["rule_id"])
             self.assertEqual(subgroup["split_depth"], 1)
+            self.assertEqual(subgroup["condition"]["field"], "path")
+            self.assertEqual(subgroup["condition"]["operator"], "prefix")
             reject(subgroup)
             blocked = run_cli(
-                "classify", "group-next", "--run-dir", run_dir,
-                "--field", "path", "--operator", "contains", "--value", "/docs/generated-10",
-                "--parent-rule-id", subgroup["rule_id"],
+                "classify", "group-next", "--run-dir", run_dir, "--parent-rule-id", broad["rule_id"],
             )
             self.assertNotEqual(blocked.returncode, 0)
-            self.assertIn("may be split only once", blocked.stderr)
+            self.assertIn("already used its one split attempt", blocked.stderr)
 
     def test_start_fast_fetches_seed_but_does_not_recursively_fetch_links(self):
         with FixtureSite() as site, tempfile.TemporaryDirectory() as folder:

@@ -708,22 +708,54 @@ def spread_sample(items: list[dict], count: int) -> list[dict]:
     return [items[index] for index in indices]
 
 
+def group_diversity_key(item: dict) -> tuple[str, str, str, str]:
+    path = urllib.parse.urlsplit(item["url"]).path
+    title_pattern = re.sub(r"\d+", "#", clean_text(str(item.get("title", ""))).lower())
+    return (path, title_pattern, str(item.get("discovered_from", "")), str(item.get("page_region", "")))
+
+
+def diverse_group_samples(items: list[dict], validation_count: int) -> tuple[list[dict], list[dict]]:
+    strata: dict[tuple[str, str, str, str], list[dict]] = {}
+    for item in items:
+        strata.setdefault(group_diversity_key(item), []).append(item)
+    if len(strata) < GROUP_PROPOSAL_SIZE:
+        raise SystemExit("grouped review requires at least 3 structurally different samples")
+    keys = sorted(strata)
+    proposal_keys = spread_sample(keys, GROUP_PROPOSAL_SIZE)
+    proposal = [strata[key].pop(0) for key in proposal_keys]
+    remaining = [item for key in keys for item in strata[key]]
+    validation = spread_sample(remaining, validation_count)
+    if len({group_diversity_key(item) for item in validation}) < min(GROUP_VALIDATION_MINIMUM, validation_count):
+        raise SystemExit("grouped review cannot form a structurally diverse validation sample")
+    return proposal, validation
+
+
+def automatic_split_condition(items: list[dict]) -> dict | None:
+    path_groups: dict[str, list[dict]] = {}
+    for item in items:
+        parent_path = str(Path(urllib.parse.urlsplit(item["url"]).path).parent).replace("\\", "/")
+        path_groups.setdefault(parent_path, []).append(item)
+    for path, members in sorted(path_groups.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        if GROUP_PROPOSAL_SIZE + GROUP_VALIDATION_MINIMUM <= len(members) < len(items):
+            return {"field": "path", "operator": "prefix", "value": path.rstrip("/") + "/"}
+    for field in ("provenance", "page_region"):
+        groups: dict[str, list[dict]] = {}
+        for item in items:
+            groups.setdefault(group_field_value(item, field), []).append(item)
+        for value, members in sorted(groups.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+            if value and GROUP_PROPOSAL_SIZE + GROUP_VALIDATION_MINIMUM <= len(members) < len(items):
+                return {"field": field, "operator": "equals", "value": value}
+    return None
+
+
 def classification_group_next(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir).resolve()
     state = load_checkpoint(run_dir)
     ensure_mutable(state)
-    if args.field not in GROUP_FIELDS:
-        raise SystemExit(f"--field must be one of: {', '.join(sorted(GROUP_FIELDS))}")
-    if args.operator not in GROUP_OPERATORS:
-        raise SystemExit(f"--operator must be one of: {', '.join(sorted(GROUP_OPERATORS))}")
-    value = clean_text(args.value)
-    if not value:
-        raise SystemExit("--value is required")
     classified = [item for item in state["candidates"] if item["decision"] != "pending"]
     uncertain = [item for item in classified if item["decision"] == "uncertain"]
     if len(uncertain) < GROUP_UNCERTAIN_MINIMUM or len(uncertain) / max(1, len(classified)) < GROUP_UNCERTAIN_RATIO:
         raise SystemExit("grouped review requires at least 50 uncertain candidates and a 20% uncertain rate")
-    condition = {"field": args.field, "operator": args.operator, "value": value}
     classification = state.setdefault("classification", {})
     parent = None
     if args.parent_rule_id:
@@ -732,6 +764,21 @@ def classification_group_next(args: argparse.Namespace) -> None:
             raise SystemExit("parent rule must be a failed validated group rule")
         if int(parent.get("split_depth", 0)) >= 1:
             raise SystemExit("a failed group may be split only once")
+        if parent.get("split_attempted"):
+            raise SystemExit("the failed group already used its one split attempt")
+        parent_items = [item for item in uncertain if item["id"] in set(parent["matched_ids"])]
+        condition = automatic_split_condition(parent_items)
+        if not condition:
+            raise SystemExit("the failed group has no viable path, provenance, or page-region split")
+    else:
+        if args.field not in GROUP_FIELDS:
+            raise SystemExit(f"--field must be one of: {', '.join(sorted(GROUP_FIELDS))}")
+        if args.operator not in GROUP_OPERATORS:
+            raise SystemExit(f"--operator must be one of: {', '.join(sorted(GROUP_OPERATORS))}")
+        value = clean_text(args.value or "")
+        if not value:
+            raise SystemExit("--value is required")
+        condition = {"field": args.field, "operator": args.operator, "value": value}
     allowed_ids = set(parent["matched_ids"]) if parent else None
     matched = sorted((
         item for item in uncertain
@@ -742,9 +789,7 @@ def classification_group_next(args: argparse.Namespace) -> None:
     if len(matched) < GROUP_PROPOSAL_SIZE + GROUP_VALIDATION_MINIMUM:
         raise SystemExit("grouped review requires at least 6 matching uncertain candidates")
     validation_count = min(GROUP_VALIDATION_MAXIMUM, max(GROUP_VALIDATION_MINIMUM, math.ceil(len(matched) * 0.10)))
-    selected = spread_sample(matched, GROUP_PROPOSAL_SIZE + validation_count)
-    proposal = selected[:GROUP_PROPOSAL_SIZE]
-    validation = selected[GROUP_PROPOSAL_SIZE:]
+    proposal, validation = diverse_group_samples(matched, validation_count)
     identity = {"condition": condition, "parent_rule_id": args.parent_rule_id or ""}
     rule_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     split_depth = int(parent.get("split_depth", 0)) + 1 if parent else 0
@@ -755,6 +800,8 @@ def classification_group_next(args: argparse.Namespace) -> None:
         "validation_ids": [item["id"] for item in validation],
         "split_depth": split_depth, "parent_rule_id": args.parent_rule_id or "",
     }
+    if parent:
+        parent["split_attempted"] = True
     save_checkpoint(run_dir, state)
     fields = ("id", "url", "title", "discovered_from", "provenance", "page_region")
     compact = lambda item: {key: item.get(key) for key in fields}
@@ -795,14 +842,15 @@ def classification_group_submit(args: argparse.Namespace) -> None:
     for row in rows:
         if row.get("decision") not in {"include", "exclude"} or row.get("confidence") != "high":
             raise SystemExit("every sample must have an include/exclude decision at high confidence")
+        if row.get("category") != category:
+            raise SystemExit("all sample categories must agree with the group rule category")
         if not clean_text(str(row.get("reason", ""))):
             raise SystemExit("every sample decision requires a reason")
     if any(row["decision"] != decision for row in rows):
         timestamp = now_iso()
-        classification.setdefault("group_rules", []).append({
-            **active, "decision": decision, "category": category, "reason": reason,
-            "sample_decisions": rows, "status": "validation_failed", "applied": 0, "at": timestamp,
-        })
+        classification.setdefault("group_rules", []).append(group_rule_record(
+            active, decision, category, reason, rows, "validation_failed", 0, timestamp,
+        ))
         classification.pop("active_group", None)
         state["updated_at"] = timestamp
         save_checkpoint(run_dir, state)
@@ -824,14 +872,23 @@ def classification_group_submit(args: argparse.Namespace) -> None:
             decision_basis="rule", reason=reason,
         )
         applied += 1
-    classification.setdefault("group_rules", []).append({
-        **active, "decision": decision, "category": category, "reason": reason,
-        "sample_decisions": rows, "status": "applied", "applied": applied, "at": timestamp,
-    })
+    classification.setdefault("group_rules", []).append(group_rule_record(
+        active, decision, category, reason, rows, "applied", applied, timestamp,
+    ))
     classification.pop("active_group", None)
     state["updated_at"] = timestamp
     save_checkpoint(run_dir, state)
     print(json.dumps({"rule_id": active["rule_id"], "applied": applied}))
+
+
+def group_rule_record(
+    active: dict, decision: str, category: str, reason: str, rows: list[dict],
+    status: str, applied: int, timestamp: str,
+) -> dict:
+    return {
+        **active, "decision": decision, "category": category, "reason": reason,
+        "sample_decisions": rows, "status": status, "applied": applied, "at": timestamp,
+    }
 
 
 def validate_decisions(rows: object, batch_ids: set[str]) -> list[str]:
@@ -1013,9 +1070,9 @@ def build_parser() -> argparse.ArgumentParser:
     submit.set_defaults(func=classification_submit)
     group_next = classify_commands.add_parser("group-next")
     group_next.add_argument("--run-dir", required=True)
-    group_next.add_argument("--field", required=True)
-    group_next.add_argument("--operator", required=True)
-    group_next.add_argument("--value", required=True)
+    group_next.add_argument("--field")
+    group_next.add_argument("--operator")
+    group_next.add_argument("--value")
     group_next.add_argument("--parent-rule-id")
     group_next.set_defaults(func=classification_group_next)
     group_submit = classify_commands.add_parser("group-submit")
