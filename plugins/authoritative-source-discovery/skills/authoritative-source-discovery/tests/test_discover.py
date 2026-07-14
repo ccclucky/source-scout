@@ -104,6 +104,10 @@ class FixtureSite:
                     return
                 if path == "/docs/fail":
                     return self.reply("text/html", "<html><head><title>Recovered</title></head><body>Recovered</body></html>")
+                if "/generated-" in path:
+                    index = int(path.rsplit("generated-", 1)[1])
+                    title_kind = ("Alpha", "Beta", "Gamma")[(index // 3) % 3]
+                    return self.reply("text/html", f"<html><head><title>Reference {title_kind}</title></head><body>Reference</body></html>")
                 self.send_response(404)
                 self.end_headers()
 
@@ -213,9 +217,21 @@ class DiscoverCliTests(unittest.TestCase):
             self.assertEqual({item["decision_basis"] for item in generated}, {"rule"})
             self.assertTrue(all([entry["basis"] for entry in item["decision_history"]] == ["model", "rule"] for item in generated))
 
-    def test_failed_group_rule_can_split_once_without_changing_candidates(self):
+    def test_group_next_rejects_unique_leaf_pages_without_structural_diversity(self):
         with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
             started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
+            run_dir = Path(json.loads(started.stdout)["run_dir"])
+            classify_all_as_uncertain(run_dir)
+            result = run_cli(
+                "classify", "group-next", "--run-dir", run_dir,
+                "--field", "path", "--operator", "prefix", "--value", "/docs/api/group-0/",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("structurally different samples", result.stderr)
+
+    def test_failed_group_rule_can_split_once_without_changing_candidates(self):
+        with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
+            started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "standard", "--output-root", folder)
             run_dir = Path(json.loads(started.stdout)["run_dir"])
             classify_all_as_uncertain(run_dir)
 

@@ -708,16 +708,20 @@ def spread_sample(items: list[dict], count: int) -> list[dict]:
     return [items[index] for index in indices]
 
 
-def group_diversity_key(item: dict) -> tuple[str, str, str, str]:
+def group_diversity_key(item: dict, condition: dict) -> tuple[str, str, str, str]:
     path = urllib.parse.urlsplit(item["url"]).path
+    subpath_bucket = str(Path(path).parent).replace("\\", "/")
+    if condition["field"] == "path" and condition["operator"] == "prefix" and path.startswith(condition["value"]):
+        relative_parts = path[len(condition["value"]):].strip("/").split("/")
+        subpath_bucket = relative_parts[0] if len(relative_parts) > 1 else ""
     title_pattern = re.sub(r"\d+", "#", clean_text(str(item.get("title", ""))).lower())
-    return (path, title_pattern, str(item.get("discovered_from", "")), str(item.get("page_region", "")))
+    return (subpath_bucket, title_pattern, str(item.get("discovered_from", "")), str(item.get("page_region", "")))
 
 
-def diverse_group_samples(items: list[dict], validation_count: int) -> tuple[list[dict], list[dict]]:
+def diverse_group_samples(items: list[dict], validation_count: int, condition: dict) -> tuple[list[dict], list[dict]]:
     strata: dict[tuple[str, str, str, str], list[dict]] = {}
     for item in items:
-        strata.setdefault(group_diversity_key(item), []).append(item)
+        strata.setdefault(group_diversity_key(item, condition), []).append(item)
     if len(strata) < GROUP_PROPOSAL_SIZE:
         raise SystemExit("grouped review requires at least 3 structurally different samples")
     keys = sorted(strata)
@@ -725,7 +729,7 @@ def diverse_group_samples(items: list[dict], validation_count: int) -> tuple[lis
     proposal = [strata[key].pop(0) for key in proposal_keys]
     remaining = [item for key in keys for item in strata[key]]
     validation = spread_sample(remaining, validation_count)
-    if len({group_diversity_key(item) for item in validation}) < min(GROUP_VALIDATION_MINIMUM, validation_count):
+    if len({group_diversity_key(item, condition) for item in validation}) < min(GROUP_VALIDATION_MINIMUM, validation_count):
         raise SystemExit("grouped review cannot form a structurally diverse validation sample")
     return proposal, validation
 
@@ -789,7 +793,7 @@ def classification_group_next(args: argparse.Namespace) -> None:
     if len(matched) < GROUP_PROPOSAL_SIZE + GROUP_VALIDATION_MINIMUM:
         raise SystemExit("grouped review requires at least 6 matching uncertain candidates")
     validation_count = min(GROUP_VALIDATION_MAXIMUM, max(GROUP_VALIDATION_MINIMUM, math.ceil(len(matched) * 0.10)))
-    proposal, validation = diverse_group_samples(matched, validation_count)
+    proposal, validation = diverse_group_samples(matched, validation_count, condition)
     identity = {"condition": condition, "parent_rule_id": args.parent_rule_id or ""}
     rule_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     split_depth = int(parent.get("split_depth", 0)) + 1 if parent else 0
