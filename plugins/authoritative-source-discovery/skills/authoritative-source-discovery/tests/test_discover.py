@@ -139,7 +139,128 @@ def run_cli(*args):
     return subprocess.run([sys.executable, str(SCRIPT), *values], capture_output=True, text=True)
 
 
+def classify_all_as_uncertain(run_dir):
+    while True:
+        batch = run_cli("classify", "next", "--run-dir", run_dir)
+        payload = json.loads(batch.stdout)
+        if not payload["items"]:
+            return
+        decisions = [{
+            "id": item["id"], "decision": "uncertain", "category": "other",
+            "confidence": "medium", "reason": "requires grouped review",
+        } for item in payload["items"]]
+        input_path = Path(run_dir) / "uncertain-batch.json"
+        input_path.write_text(json.dumps(decisions), encoding="utf-8")
+        submitted = run_cli("classify", "submit", "--run-dir", run_dir, "--input", input_path)
+        if submitted.returncode != 0:
+            raise AssertionError(submitted.stderr)
+
+
 class DiscoverCliTests(unittest.TestCase):
+    def test_group_next_returns_disjoint_proposal_and_scaled_validation_samples(self):
+        with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
+            started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
+            self.assertEqual(started.returncode, 0, started.stderr)
+            run_dir = Path(json.loads(started.stdout)["run_dir"])
+            classify_all_as_uncertain(run_dir)
+
+            result = run_cli(
+                "classify", "group-next", "--run-dir", run_dir,
+                "--field", "path", "--operator", "prefix", "--value", "/docs/generated-",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["matched"], 60)
+            self.assertEqual(len(payload["proposal_items"]), 3)
+            self.assertEqual(len(payload["validation_items"]), 6)
+            proposal_ids = {item["id"] for item in payload["proposal_items"]}
+            validation_ids = {item["id"] for item in payload["validation_items"]}
+            self.assertTrue(proposal_ids.isdisjoint(validation_ids))
+            self.assertEqual(payload["condition"], {
+                "field": "path", "operator": "prefix", "value": "/docs/generated-",
+            })
+
+    def test_group_submit_applies_unanimously_validated_rule_and_preserves_history(self):
+        with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
+            started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
+            run_dir = Path(json.loads(started.stdout)["run_dir"])
+            classify_all_as_uncertain(run_dir)
+            planned = run_cli(
+                "classify", "group-next", "--run-dir", run_dir,
+                "--field", "path", "--operator", "prefix", "--value", "/docs/generated-",
+            )
+            plan = json.loads(planned.stdout)
+            samples = plan["proposal_items"] + plan["validation_items"]
+            submission = {
+                "rule_id": plan["rule_id"], "decision": "include", "category": "reference",
+                "reason": "generated API reference pages are in scope",
+                "sample_decisions": [{
+                    "id": item["id"], "decision": "include", "confidence": "high",
+                    "reason": "in-scope generated API reference",
+                } for item in samples],
+            }
+            input_path = run_dir / "group-decision.json"
+            input_path.write_text(json.dumps(submission), encoding="utf-8")
+
+            submitted = run_cli("classify", "group-submit", "--run-dir", run_dir, "--input", input_path)
+            self.assertEqual(submitted.returncode, 0, submitted.stderr)
+            self.assertEqual(json.loads(submitted.stdout)["applied"], 60)
+            state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+            generated = [item for item in state["candidates"] if "/docs/generated-" in item["url"]]
+            self.assertEqual({item["decision"] for item in generated}, {"include"})
+            self.assertEqual({item["decision_basis"] for item in generated}, {"rule"})
+            self.assertTrue(all([entry["basis"] for entry in item["decision_history"]] == ["model", "rule"] for item in generated))
+
+    def test_failed_group_rule_can_split_once_without_changing_candidates(self):
+        with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
+            started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
+            run_dir = Path(json.loads(started.stdout)["run_dir"])
+            classify_all_as_uncertain(run_dir)
+
+            def plan(value, parent=None):
+                args = [
+                    "classify", "group-next", "--run-dir", run_dir,
+                    "--field", "path", "--operator", "contains", "--value", value,
+                ]
+                if parent:
+                    args.extend(["--parent-rule-id", parent])
+                result = run_cli(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+
+            def reject(group_plan):
+                samples = group_plan["proposal_items"] + group_plan["validation_items"]
+                rows = [{
+                    "id": item["id"], "decision": "include", "confidence": "high", "reason": "mostly in scope",
+                } for item in samples]
+                rows[-1]["decision"] = "exclude"
+                rows[-1]["reason"] = "counterexample"
+                input_path = run_dir / "rejected-group.json"
+                input_path.write_text(json.dumps({
+                    "rule_id": group_plan["rule_id"], "decision": "include", "category": "reference",
+                    "reason": "proposed generated reference rule", "sample_decisions": rows,
+                }), encoding="utf-8")
+                result = run_cli("classify", "group-submit", "--run-dir", run_dir, "--input", input_path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["status"], "validation_failed")
+
+            broad = plan("/docs/generated-")
+            reject(broad)
+            state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+            generated = [item for item in state["candidates"] if "/docs/generated-" in item["url"]]
+            self.assertEqual({item["decision"] for item in generated}, {"uncertain"})
+
+            subgroup = plan("/docs/generated-1", broad["rule_id"])
+            self.assertEqual(subgroup["split_depth"], 1)
+            reject(subgroup)
+            blocked = run_cli(
+                "classify", "group-next", "--run-dir", run_dir,
+                "--field", "path", "--operator", "contains", "--value", "/docs/generated-10",
+                "--parent-rule-id", subgroup["rule_id"],
+            )
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("may be split only once", blocked.stderr)
+
     def test_start_fast_fetches_seed_but_does_not_recursively_fetch_links(self):
         with FixtureSite() as site, tempfile.TemporaryDirectory() as folder:
             result = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
@@ -223,15 +344,19 @@ class DiscoverCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("medium/low confidence must be uncertain", result.stderr)
 
-    def test_classification_batch_must_be_complete_and_fast_budget_opens_circuit(self):
+    def test_classification_batches_have_no_run_wide_circuit_and_enforce_batch_limit(self):
         with FixtureSite(extra_sitemap_count=40) as site, tempfile.TemporaryDirectory() as folder:
             started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
             run_dir = Path(json.loads(started.stdout)["run_dir"])
             batch_result = run_cli("classify", "next", "--run-dir", run_dir, "--limit", "50")
             payload = json.loads(batch_result.stdout)
-            self.assertEqual(payload["returned"], 25)
-            self.assertTrue(payload["circuit_open"])
-            self.assertLessEqual(payload["evidence_chars_issued"], payload["evidence_char_budget"])
+            self.assertGreater(payload["returned"], 25)
+            self.assertLessEqual(payload["returned"], 50)
+            self.assertNotIn("circuit_open", payload)
+
+            oversized = run_cli("classify", "next", "--run-dir", run_dir, "--limit", "101")
+            self.assertNotEqual(oversized.returncode, 0)
+            self.assertIn("--limit must be between 1 and 100", oversized.stderr)
 
             one = payload["items"][0]
             incomplete = run_dir / "incomplete.json"
@@ -242,6 +367,16 @@ class DiscoverCliTests(unittest.TestCase):
             submitted = run_cli("classify", "submit", "--run-dir", run_dir, "--input", incomplete)
             self.assertNotEqual(submitted.returncode, 0)
             self.assertIn("batch ids must be submitted exactly once", submitted.stderr)
+
+    def test_mode_specific_default_page_limits(self):
+        with FixtureSite() as site, tempfile.TemporaryDirectory() as folder:
+            expected = {"fast": 100, "standard": 500, "deep": 2000}
+            for mode, limit in expected.items():
+                started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", mode, "--output-root", folder)
+                self.assertEqual(started.returncode, 0, started.stderr)
+                run_dir = Path(json.loads(started.stdout)["run_dir"])
+                state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+                self.assertEqual(state["max_pages"], limit)
 
     def test_deep_requests_dynamic_evidence_and_resume_ingests_rendered_links(self):
         with FixtureSite(dynamic_shell=True) as site, tempfile.TemporaryDirectory() as folder:

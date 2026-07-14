@@ -41,11 +41,13 @@ All modes use the same cleanup and acceptance policy. Fast still applies determi
 5. Classify remaining candidates in batches using the page metadata and link context returned by the crawler. For each candidate choose exactly one: `include`, `exclude`, or `uncertain`; add a category and short reason. Do not send thousands of URLs or full pages in one prompt.
    Read [classification-policy.md](references/classification-policy.md) before classifying.
    Extraction of fetch time, final URL, status, content type, title, description, canonical URL, source page, anchor text, page region, and optional content hash is deterministic script work and must not consume model tokens. Send only rule-ambiguous candidates with minimal evidence to the model.
-   Use a second semantic pass with a short main-content excerpt only for a small residual set; never send full pages. If many candidates need enrichment, group them by host, path, provenance, and page region, sample a few per group to derive a rule, then reclassify deterministically. If ambiguity remains broad, enter `decision_required`. The script enforces item and evidence-character ceilings; the agent must also enforce the model-token ceiling and never exceed it silently.
+   Use a second semantic pass with a short main-content excerpt only for a small residual set; never send full pages. Start grouped handling only when at least 50 classified candidates are uncertain and they represent at least 20% of classified candidates. Group by host, path, provenance, and page region. Use only auditable structured conditions over host, path prefix, provenance, page region, and title patterns with equality, prefix, or containment operators; never execute generated code or arbitrary regular expressions.
+
+   A group needs at least six candidates. Use three diverse candidates to propose a rule, then validate it on a disjoint 10% sample, with a minimum of three and maximum of twenty validation items. Select both samples across differing subpaths, title patterns, source pages, and page regions. All validation items must agree. On failure, revoke the rule and split the group at most once, preferring subpath, then provenance and page region. If the subgroup still fails, leave it uncertain. Explain estimated token consumption when presenting the collection modes. After the user approves a mode, do not impose a runtime token circuit breaker or enter `decision_required` merely because an estimated token budget was reached.
    Apply model-derived group rules only to structurally homogeneous candidates and validate them against held-out pages. Revoke a rule when validation fails; leave unverifiable groups uncertain.
 6. Retry malformed or failed classification once. If still unresolved, keep `uncertain`; never silently discard it. Ask the user to review uncertain items when they are material.
    If uncertain items are numerous, diagnose scope or classification policy and rerun before asking for review. If ambiguity remains, group items by a shared decision rule; do not offload dozens of item-level decisions to the user.
-7. Request and submit complete classification batches until no pending items remain or the model circuit opens:
+7. Request and submit complete classification batches until no pending items remain. Use 50 items by default, reduce the batch size when evidence is unusually long, and never exceed 100 items in one batch. There is no run-wide classification-batch limit:
 
    ```powershell
    python scripts/discover.py classify next --run-dir <RUN_DIR> --limit 50
@@ -53,6 +55,22 @@ All modes use the same cleanup and acceptance policy. Fast still applies determi
    ```
 
    Every row requires `id`, `decision`, `category`, `confidence`, and `reason`. `include`/`exclude` require `high` confidence; `medium`/`low` must be `uncertain`. Submit every returned batch ID exactly once. User overrides use:
+
+   After ordinary classification, use grouped review only when at least 50 candidates are uncertain and they represent at least 20% of classified candidates. Ask the script for disjoint proposal and validation samples using one allowed structured condition:
+
+   ```powershell
+   python scripts/discover.py classify group-next --run-dir <RUN_DIR> --field path --operator prefix --value /docs/api/
+   ```
+
+   `field` is one of `host`, `path`, `provenance`, `page_region`, or `title`; `operator` is `equals`, `prefix`, or `contains`. Review every returned sample, then submit the individual high-confidence sample decisions together with the proposed rule decision:
+
+   ```powershell
+   python scripts/discover.py classify group-submit --run-dir <RUN_DIR> --input group-decision.json
+   ```
+
+   The script applies the rule only when all proposal and validation samples agree. A counterexample records `validation_failed` and leaves the candidates uncertain. Narrow a failed group once by passing `--parent-rule-id <FAILED_RULE_ID>` to `group-next`; a second split is rejected.
+
+   User overrides use:
 
    ```powershell
    python scripts/discover.py classify override --run-dir <RUN_DIR> --id <ID> --decision <include|exclude|uncertain> --reason <REASON>
@@ -87,15 +105,15 @@ Do not finish silently when discovery has not converged. Continue automatically 
 
 ## Dynamic pages and limits
 
-Use ordinary HTTP first. Fast never uses browser rendering. In Standard/Deep, when the checkpoint reports `dynamic_capability_required`, use already available browser tooling to collect rendered links, save a JSON object keyed by source URL, then resume:
+Use ordinary HTTP first. Fast never uses browser rendering. In Standard, use already available browser tooling when static content is clearly insufficient; when no browser capability exists, continue statically and report the coverage gap. In Deep, dynamic coverage is part of the mode promise: when the checkpoint reports `dynamic_capability_required`, ask the user to enable additional page-reading capability. After approval, prefer already available browser tooling, collect rendered links, save a JSON object keyed by source URL in the run directory, then resume from the existing checkpoint without refetching completed pages:
 
 ```powershell
 python scripts/discover.py resume --run-dir <RUN_DIR> --rendered-links rendered-links.json
 ```
 
-Never install browser dependencies without explicit approval. Explain expected coverage loss in user-facing terms; expose Playwright details only on request.
+If no browser capability exists, explain the installation size, time, and location and request separate explicit approval to install it. After approval, install only into an isolated workspace environment; never modify the installed skill or global Python environment. Preserve the checkpoint if installation or rendering fails, then offer retry or a constrained export with the dynamic-coverage gap stated explicitly.
 
-Use a 500-page default limit. When the run reports `decision_required`, explain the coverage impact and recommended action. Resume with a larger approved ceiling via `python scripts/discover.py resume --run-dir <RUN_DIR> --max-pages <N>`. Above 2,000 pages, pause and suggest narrowing or batching. Use retries, backoff on 429, run-local evidence, and resumable state.
+Use mode-specific default page limits: 100 for Fast, 500 for Standard, and 2,000 for Deep. These limits control crawl size and time, not model tokens. When the run reports `decision_required`, show the remaining queue, estimate the added time, explain the coverage impact, and recommend continuing or narrowing the scope. Resume with a larger approved ceiling via `python scripts/discover.py resume --run-dir <RUN_DIR> --max-pages <N>`. Never report completion while the queue remains unconverged. Use retries, backoff on 429, run-local evidence, and resumable state.
 
 Checkpointing is required, not optional. Persist the pending queue, visited URLs, candidates and evidence, retry state, scope, mode, budget, classification progress, and user decisions after each crawl/classification batch, before `decision_required`, and before recoverable shutdown. Resume idempotently without refetching or reclassifying completed work; support retrying failed items separately.
 
@@ -117,6 +135,6 @@ Access limitation is not noise. Mark robots-blocked or otherwise inaccessible ca
 
 ## Completion checks
 
-Do not call the first version complete until executable tests cover distinct Fast/Standard/Deep behavior, checkpoint interruption/resume, robots/429/404 handling, dynamic fallback, model-token circuit breaking, grouped handling of broad ambiguity, at least two real documentation sites, and the output/completion-status contract. Prompt-only evals and basic unit tests are insufficient.
+Do not call the first version complete until executable tests cover distinct Fast/Standard/Deep behavior and the pre-run token-consumption notice, checkpoint interruption/resume, robots/429/404 handling, dynamic fallback, grouped handling of broad ambiguity, at least two real documentation sites, and the output/completion-status contract. Prompt-only evals and basic unit tests are insufficient.
 
 Keep tests lightweight: use unit tests and mocked HTTP responses for ordinary logic, a tiny Python-standard-library local page fixture for recursive discovery, and direct interruption/resume simulation for checkpoints. Do not deploy a test website. Use real documentation sites only as pre-release smoke tests so external redesigns are not mistaken for code regressions.

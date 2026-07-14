@@ -7,6 +7,7 @@ import csv
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import socket
 import sys
@@ -39,8 +40,15 @@ ALLOWED_CATEGORIES = {
     "documentation", "reference", "research", "example", "case", "blog",
     "marketing", "recruitment", "navigation", "other",
 }
-MODEL_ITEM_BUDGETS = {"fast": 25, "standard": 200, "deep": 1000}
-MODEL_EVIDENCE_CHAR_BUDGETS = {"fast": 20_000, "standard": 120_000, "deep": 600_000}
+MODE_PAGE_LIMITS = {"fast": 100, "standard": 500, "deep": 2_000}
+MAX_CLASSIFICATION_BATCH = 100
+GROUP_UNCERTAIN_MINIMUM = 50
+GROUP_UNCERTAIN_RATIO = 0.20
+GROUP_PROPOSAL_SIZE = 3
+GROUP_VALIDATION_MINIMUM = 3
+GROUP_VALIDATION_MAXIMUM = 20
+GROUP_FIELDS = {"host", "path", "provenance", "page_region", "title"}
+GROUP_OPERATORS = {"equals", "prefix", "contains"}
 
 
 def now_iso() -> str:
@@ -370,13 +378,9 @@ def initialize_state(seed: str, mode: str, scope: str, scope_roots: list[str], m
         "channels": {"seed": True, "sitemap": False, "llms": False, "static_links": False, "dynamic": "not_used"},
         "robots": {},
         "classification": {
-            "item_budget": MODEL_ITEM_BUDGETS[mode],
-            "evidence_char_budget": MODEL_EVIDENCE_CHAR_BUDGETS[mode],
             "submitted": 0,
-            "evidence_chars_submitted": 0,
             "active_batch_ids": [],
             "active_batch_chars": 0,
-            "circuit_open": False,
         },
     }
 
@@ -574,7 +578,8 @@ def start_command(args: argparse.Namespace) -> None:
             raise SystemExit(f"invalid --scope-root: {scope_root}")
         validate_public_url(normalized_root, args.allow_private)
     run_dir = make_run_dir(args.output_root, seed, args.project)
-    state = initialize_state(seed, args.mode, args.scope, args.scope_root, args.max_pages, run_dir)
+    max_pages = args.max_pages if args.max_pages is not None else MODE_PAGE_LIMITS[args.mode]
+    state = initialize_state(seed, args.mode, args.scope, args.scope_root, max_pages, run_dir)
     save_checkpoint(run_dir, state)
     prepare_discovery(state)
     save_checkpoint(run_dir, state)
@@ -650,40 +655,20 @@ def classification_next(args: argparse.Namespace) -> None:
     state = load_checkpoint(run_dir)
     ensure_mutable(state)
     pending = [item for item in state["candidates"] if item["decision"] == "pending"]
+    if not 1 <= args.limit <= MAX_CLASSIFICATION_BATCH:
+        raise SystemExit(f"--limit must be between 1 and {MAX_CLASSIFICATION_BATCH}")
     classification = state.setdefault("classification", {
-        "item_budget": MODEL_ITEM_BUDGETS[state["mode"]], "submitted": 0,
-        "evidence_char_budget": MODEL_EVIDENCE_CHAR_BUDGETS[state["mode"]],
-        "evidence_chars_submitted": 0, "active_batch_ids": [], "active_batch_chars": 0,
-        "circuit_open": False,
+        "submitted": 0, "active_batch_ids": [], "active_batch_chars": 0,
     })
     active_ids = classification.get("active_batch_ids", [])
     if active_ids:
         active_set = set(active_ids)
         batch = [item for item in pending if item["id"] in active_set]
     else:
-        remaining_budget = max(0, classification["item_budget"] - classification["submitted"])
-        remaining_chars = max(0, classification["evidence_char_budget"] - classification["evidence_chars_submitted"])
-        batch = []
-        batch_chars = 0
-        for item in pending[: min(args.limit, remaining_budget)]:
-            size = len(json.dumps(item, ensure_ascii=False))
-            if batch and batch_chars + size > remaining_chars:
-                break
-            if size > remaining_chars:
-                break
-            batch.append(item)
-            batch_chars += size
+        batch = pending[:args.limit]
+        batch_chars = sum(len(json.dumps(item, ensure_ascii=False)) for item in batch)
         classification["active_batch_ids"] = [item["id"] for item in batch]
         classification["active_batch_chars"] = batch_chars
-    classification["circuit_open"] = len(pending) > len(batch) and (
-        classification["submitted"] + len(batch) >= classification["item_budget"]
-        or classification.get("evidence_chars_submitted", 0) + classification.get("active_batch_chars", 0)
-        >= classification["evidence_char_budget"]
-        or len(batch) < min(args.limit, max(0, classification["item_budget"] - classification["submitted"]))
-    )
-    if classification["circuit_open"]:
-        state["status"] = "decision_required"
-        state["decision_reason"] = "classification_budget_limited"
     save_checkpoint(run_dir, state)
     fields = (
         "id", "url", "title", "description", "link_text", "page_region",
@@ -692,11 +677,161 @@ def classification_next(args: argparse.Namespace) -> None:
     print(json.dumps({
         "items": [{key: item.get(key) for key in fields} for item in batch],
         "returned": len(batch), "remaining": max(0, len(pending) - len(batch)),
-        "item_budget": classification["item_budget"],
-        "evidence_char_budget": classification["evidence_char_budget"],
         "evidence_chars_issued": classification.get("active_batch_chars", 0),
-        "circuit_open": classification["circuit_open"],
     }, ensure_ascii=False, indent=2))
+
+
+def group_field_value(item: dict, field: str) -> str:
+    if field == "host":
+        return urllib.parse.urlsplit(item["url"]).netloc.lower()
+    if field == "path":
+        return urllib.parse.urlsplit(item["url"]).path
+    return clean_text(str(item.get(field, "")))
+
+
+def group_condition_matches(item: dict, condition: dict) -> bool:
+    actual = group_field_value(item, condition["field"])
+    expected = condition["value"]
+    if condition["operator"] == "equals":
+        return actual == expected
+    if condition["operator"] == "prefix":
+        return actual.startswith(expected)
+    return expected in actual
+
+
+def spread_sample(items: list[dict], count: int) -> list[dict]:
+    if count >= len(items):
+        return list(items)
+    if count == 1:
+        return [items[0]]
+    indices = [round(index * (len(items) - 1) / (count - 1)) for index in range(count)]
+    return [items[index] for index in indices]
+
+
+def classification_group_next(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir).resolve()
+    state = load_checkpoint(run_dir)
+    ensure_mutable(state)
+    if args.field not in GROUP_FIELDS:
+        raise SystemExit(f"--field must be one of: {', '.join(sorted(GROUP_FIELDS))}")
+    if args.operator not in GROUP_OPERATORS:
+        raise SystemExit(f"--operator must be one of: {', '.join(sorted(GROUP_OPERATORS))}")
+    value = clean_text(args.value)
+    if not value:
+        raise SystemExit("--value is required")
+    classified = [item for item in state["candidates"] if item["decision"] != "pending"]
+    uncertain = [item for item in classified if item["decision"] == "uncertain"]
+    if len(uncertain) < GROUP_UNCERTAIN_MINIMUM or len(uncertain) / max(1, len(classified)) < GROUP_UNCERTAIN_RATIO:
+        raise SystemExit("grouped review requires at least 50 uncertain candidates and a 20% uncertain rate")
+    condition = {"field": args.field, "operator": args.operator, "value": value}
+    classification = state.setdefault("classification", {})
+    parent = None
+    if args.parent_rule_id:
+        parent = next((rule for rule in classification.get("group_rules", []) if rule["rule_id"] == args.parent_rule_id), None)
+        if not parent or parent.get("status") != "validation_failed":
+            raise SystemExit("parent rule must be a failed validated group rule")
+        if int(parent.get("split_depth", 0)) >= 1:
+            raise SystemExit("a failed group may be split only once")
+    allowed_ids = set(parent["matched_ids"]) if parent else None
+    matched = sorted((
+        item for item in uncertain
+        if (allowed_ids is None or item["id"] in allowed_ids) and group_condition_matches(item, condition)
+    ), key=lambda item: item["url"])
+    if parent and len(matched) >= len(parent["matched_ids"]):
+        raise SystemExit("a split rule must select a smaller subgroup")
+    if len(matched) < GROUP_PROPOSAL_SIZE + GROUP_VALIDATION_MINIMUM:
+        raise SystemExit("grouped review requires at least 6 matching uncertain candidates")
+    validation_count = min(GROUP_VALIDATION_MAXIMUM, max(GROUP_VALIDATION_MINIMUM, math.ceil(len(matched) * 0.10)))
+    selected = spread_sample(matched, GROUP_PROPOSAL_SIZE + validation_count)
+    proposal = selected[:GROUP_PROPOSAL_SIZE]
+    validation = selected[GROUP_PROPOSAL_SIZE:]
+    identity = {"condition": condition, "parent_rule_id": args.parent_rule_id or ""}
+    rule_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    split_depth = int(parent.get("split_depth", 0)) + 1 if parent else 0
+    classification["active_group"] = {
+        "rule_id": rule_id, "condition": condition,
+        "matched_ids": [item["id"] for item in matched],
+        "proposal_ids": [item["id"] for item in proposal],
+        "validation_ids": [item["id"] for item in validation],
+        "split_depth": split_depth, "parent_rule_id": args.parent_rule_id or "",
+    }
+    save_checkpoint(run_dir, state)
+    fields = ("id", "url", "title", "discovered_from", "provenance", "page_region")
+    compact = lambda item: {key: item.get(key) for key in fields}
+    print(json.dumps({
+        "rule_id": rule_id, "condition": condition, "matched": len(matched), "split_depth": split_depth,
+        "proposal_items": [compact(item) for item in proposal],
+        "validation_items": [compact(item) for item in validation],
+    }, ensure_ascii=False, indent=2))
+
+
+def classification_group_submit(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir).resolve()
+    state = load_checkpoint(run_dir)
+    ensure_mutable(state)
+    payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("group submission must be a JSON object")
+    classification = state.setdefault("classification", {})
+    active = classification.get("active_group")
+    if not active or payload.get("rule_id") != active.get("rule_id"):
+        raise SystemExit("group submission does not match the active rule")
+    decision = payload.get("decision")
+    category = payload.get("category")
+    reason = clean_text(str(payload.get("reason", "")))
+    if decision not in {"include", "exclude"}:
+        raise SystemExit("group rule decision must be include or exclude")
+    if category not in ALLOWED_CATEGORIES:
+        raise SystemExit("invalid group rule category")
+    if not reason:
+        raise SystemExit("group rule reason is required")
+    rows = payload.get("sample_decisions")
+    if not isinstance(rows, list):
+        raise SystemExit("sample_decisions must be a JSON array")
+    required_ids = set(active["proposal_ids"] + active["validation_ids"])
+    supplied_ids = {row.get("id") for row in rows if isinstance(row, dict)}
+    if supplied_ids != required_ids or len(rows) != len(required_ids):
+        raise SystemExit("all proposal and validation samples must be submitted exactly once")
+    for row in rows:
+        if row.get("decision") not in {"include", "exclude"} or row.get("confidence") != "high":
+            raise SystemExit("every sample must have an include/exclude decision at high confidence")
+        if not clean_text(str(row.get("reason", ""))):
+            raise SystemExit("every sample decision requires a reason")
+    if any(row["decision"] != decision for row in rows):
+        timestamp = now_iso()
+        classification.setdefault("group_rules", []).append({
+            **active, "decision": decision, "category": category, "reason": reason,
+            "sample_decisions": rows, "status": "validation_failed", "applied": 0, "at": timestamp,
+        })
+        classification.pop("active_group", None)
+        state["updated_at"] = timestamp
+        save_checkpoint(run_dir, state)
+        print(json.dumps({"rule_id": active["rule_id"], "status": "validation_failed", "applied": 0}))
+        return
+    by_id = {item["id"]: item for item in state["candidates"]}
+    applied = 0
+    timestamp = now_iso()
+    for item_id in active["matched_ids"]:
+        item = by_id.get(item_id)
+        if not item or item["decision"] != "uncertain" or not group_condition_matches(item, active["condition"]):
+            continue
+        item.setdefault("decision_history", []).append({
+            "basis": "rule", "decision": decision, "confidence": "high",
+            "reason": reason, "rule_id": active["rule_id"], "at": timestamp,
+        })
+        item.update(
+            decision=decision, category=category, confidence="high",
+            decision_basis="rule", reason=reason,
+        )
+        applied += 1
+    classification.setdefault("group_rules", []).append({
+        **active, "decision": decision, "category": category, "reason": reason,
+        "sample_decisions": rows, "status": "applied", "applied": applied, "at": timestamp,
+    })
+    classification.pop("active_group", None)
+    state["updated_at"] = timestamp
+    save_checkpoint(run_dir, state)
+    print(json.dumps({"rule_id": active["rule_id"], "applied": applied}))
 
 
 def validate_decisions(rows: object, batch_ids: set[str]) -> list[str]:
@@ -736,10 +871,7 @@ def classification_submit(args: argparse.Namespace) -> None:
     pending_by_id = {item["id"]: item for item in state["candidates"] if item["decision"] == "pending"}
     rows = json.loads(Path(args.input).read_text(encoding="utf-8"))
     classification = state.setdefault("classification", {
-        "item_budget": MODEL_ITEM_BUDGETS[state["mode"]], "submitted": 0,
-        "evidence_char_budget": MODEL_EVIDENCE_CHAR_BUDGETS[state["mode"]],
-        "evidence_chars_submitted": 0, "active_batch_ids": [], "active_batch_chars": 0,
-        "circuit_open": False,
+        "submitted": 0, "active_batch_ids": [], "active_batch_chars": 0,
     })
     active_ids = set(classification.get("active_batch_ids", []))
     supplied_ids = {row.get("id") for row in rows} if isinstance(rows, list) else set()
@@ -759,7 +891,6 @@ def classification_submit(args: argparse.Namespace) -> None:
             "reason": clean_text(row["reason"]), "at": now_iso(),
         })
     classification["submitted"] += len(rows)
-    classification["evidence_chars_submitted"] += classification.get("active_batch_chars", 0)
     classification["active_batch_ids"] = []
     classification["active_batch_chars"] = 0
     state["updated_at"] = now_iso()
@@ -858,7 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--scope-root", action="append", default=[], help="Additional verified official URL root; repeatable")
     start.add_argument("--output-root", default="output")
     start.add_argument("--project")
-    start.add_argument("--max-pages", type=int, default=500)
+    start.add_argument("--max-pages", type=int)
     start.add_argument("--allow-private", action="store_true", help=argparse.SUPPRESS)
     start.set_defaults(func=start_command)
     resume = commands.add_parser("resume")
@@ -880,6 +1011,17 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--run-dir", required=True)
     submit.add_argument("--input", required=True)
     submit.set_defaults(func=classification_submit)
+    group_next = classify_commands.add_parser("group-next")
+    group_next.add_argument("--run-dir", required=True)
+    group_next.add_argument("--field", required=True)
+    group_next.add_argument("--operator", required=True)
+    group_next.add_argument("--value", required=True)
+    group_next.add_argument("--parent-rule-id")
+    group_next.set_defaults(func=classification_group_next)
+    group_submit = classify_commands.add_parser("group-submit")
+    group_submit.add_argument("--run-dir", required=True)
+    group_submit.add_argument("--input", required=True)
+    group_submit.set_defaults(func=classification_group_submit)
     override = classify_commands.add_parser("override")
     override.add_argument("--run-dir", required=True)
     override.add_argument("--id", required=True)
