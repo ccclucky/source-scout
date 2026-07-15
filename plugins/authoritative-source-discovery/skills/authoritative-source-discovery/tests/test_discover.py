@@ -1,9 +1,11 @@
 import json
+import importlib.util
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -12,8 +14,19 @@ SKILL_ROOT = Path(__file__).parents[1]
 SCRIPT = SKILL_ROOT / "scripts" / "discover.py"
 
 
+def load_discover_module():
+    spec = importlib.util.spec_from_file_location("discover_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+DISCOVER = load_discover_module()
+
+
 class FixtureSite:
-    def __init__(self, extra_sitemap_count=0, dynamic_shell=False, sitemap_index=False, persistent_failure=False, unsafe_targets=False, blocked_sitemap=False, official_external_url=None):
+    def __init__(self, extra_sitemap_count=0, dynamic_shell=False, sitemap_index=False, persistent_failure=False, unsafe_targets=False, blocked_sitemap=False, official_external_url=None, malformed_llms=False):
         self.requests: list[str] = []
         self.fail_once = True
         self.extra_sitemap_count = extra_sitemap_count
@@ -23,6 +36,7 @@ class FixtureSite:
         self.unsafe_targets = unsafe_targets
         self.blocked_sitemap = blocked_sitemap
         self.official_external_url = official_external_url
+        self.malformed_llms = malformed_llms
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -48,6 +62,8 @@ class FixtureSite:
                         f"<urlset><url><loc>{outer.origin}/docs/start</loc></url>"
                         f"<url><loc>{outer.origin}/docs/guide</loc></url>{extra}</urlset>",
                     )
+                if path == "/llms.txt" and outer.malformed_llms:
+                    return self.reply("text/plain", "- [Broken local example](http://127.0.0.1:[PORT)\n")
                 if path == "/sitemap_index.xml" and outer.sitemap_index:
                     return self.reply(
                         "application/xml",
@@ -161,6 +177,33 @@ def classify_all_as_uncertain(run_dir):
 
 
 class DiscoverCliTests(unittest.TestCase):
+    def test_malformed_inventory_url_does_not_abort_start(self):
+        with FixtureSite(malformed_llms=True) as site, tempfile.TemporaryDirectory() as folder:
+            result = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("/llms.txt", site.requests)
+            run_dir = Path(json.loads(result.stdout)["run_dir"])
+            state = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+            self.assertNotIn("http://127.0.0.1:[PORT", {item["url"] for item in state["candidates"]})
+
+    def test_proxy_synthetic_dns_for_public_hostname_is_allowed_without_weakening_private_ip_checks(self):
+        synthetic = [(2, 1, 6, "", ("198.18.0.7", 0))]
+        with mock.patch.object(DISCOVER.socket, "getaddrinfo", return_value=synthetic), mock.patch.object(
+            DISCOVER.urllib.request, "getproxies", return_value={"https": "http://127.0.0.1:7897"},
+        ), mock.patch.object(DISCOVER.urllib.request, "proxy_bypass", return_value=False):
+            DISCOVER.validate_public_url("https://docs.python.org/tutorial")
+        with mock.patch.object(DISCOVER.socket, "getaddrinfo", return_value=synthetic), mock.patch.object(
+            DISCOVER.urllib.request, "getproxies", return_value={},
+        ), self.assertRaises(SystemExit):
+            DISCOVER.validate_public_url("https://docs.python.org/tutorial")
+        with self.assertRaises(SystemExit):
+            DISCOVER.validate_public_url("https://198.18.0.7/tutorial")
+        private = [(2, 1, 6, "", ("10.0.0.8", 0))]
+        with mock.patch.object(DISCOVER.socket, "getaddrinfo", return_value=private), mock.patch.object(
+            DISCOVER.urllib.request, "getproxies", return_value={"https": "http://127.0.0.1:7897"},
+        ), mock.patch.object(DISCOVER.urllib.request, "proxy_bypass", return_value=False), self.assertRaises(SystemExit):
+            DISCOVER.validate_public_url("https://internal.example/tutorial")
+
     def test_group_next_returns_disjoint_proposal_and_scaled_validation_samples(self):
         with FixtureSite(extra_sitemap_count=60) as site, tempfile.TemporaryDirectory() as folder:
             started = run_cli("start", "--url", site.origin + "/docs/start", "--mode", "fast", "--output-root", folder)

@@ -49,6 +49,7 @@ GROUP_VALIDATION_MINIMUM = 3
 GROUP_VALIDATION_MAXIMUM = 20
 GROUP_FIELDS = {"host", "path", "provenance", "page_region", "title"}
 GROUP_OPERATORS = {"equals", "prefix", "contains"}
+SYNTHETIC_PROXY_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 def now_iso() -> str:
@@ -60,8 +61,11 @@ def clean_text(value: str) -> str:
 
 
 def normalize_url(value: str, base: str | None = None) -> str | None:
-    absolute = urllib.parse.urljoin(base or value, value.strip())
-    parts = urllib.parse.urlsplit(absolute)
+    try:
+        absolute = urllib.parse.urljoin(base or value, value.strip())
+        parts = urllib.parse.urlsplit(absolute)
+    except (UnicodeError, ValueError):
+        return None
     if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
         return None
     path = re.sub(r"/{2,}", "/", parts.path or "/")
@@ -549,16 +553,27 @@ def validate_public_url(url: str, allow_private: bool = False) -> None:
     """Reject local/private targets unless explicitly enabled for fixture testing."""
     if allow_private:
         return
-    hostname = urllib.parse.urlsplit(url).hostname
+    parts = urllib.parse.urlsplit(url)
+    hostname = parts.hostname
     if not hostname:
         raise SystemExit("a public http(s) seed URL is required")
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None and not literal_ip.is_global:
+        raise SystemExit(f"public URL required; private or local address rejected: {hostname}")
+    proxies = urllib.request.getproxies()
+    proxy_configured = bool(proxies.get(parts.scheme) or proxies.get("all"))
+    proxy_applies = proxy_configured and not urllib.request.proxy_bypass(hostname)
     try:
         addresses = {row[4][0] for row in socket.getaddrinfo(hostname, None)}
     except socket.gaierror as error:
         raise SystemExit(f"cannot resolve public URL host: {hostname}") from error
     for address in addresses:
         ip = ipaddress.ip_address(address)
-        if not ip.is_global:
+        proxy_synthetic = literal_ip is None and proxy_applies and ip in SYNTHETIC_PROXY_NETWORK
+        if not ip.is_global and not proxy_synthetic:
             raise SystemExit(f"public URL required; private or local address rejected: {hostname}")
 
 
