@@ -1,12 +1,12 @@
 {
-  "name": "authoritative-source-tools",
+  "name": "source-scout-tools",
   "owner": {
     "name": "ccclucky"
   },
   "plugins": [
     {
-      "name": "authoritative-source-discovery",
-      "source": "./plugins/authoritative-source-discovery",
+      "name": "source-scout",
+      "source": "./plugins/source-scout",
       "description": "Discover and organize official or directly referenced web sources while reducing irrelevant noise."
     }
   ]

@@ -1,4 +1,4 @@
-"""Stateful, deterministic discovery helper for Authoritative Source Discovery."""
+"""Stateful, deterministic discovery helper for Source Scout."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 
-USER_AGENT = "AuthoritativeSourceDiscovery/1.0"
+USER_AGENT = "SourceScout/1.0"
 TRACKING_KEYS = {"gclid", "fbclid", "ref", "source"}
 TRACKING_PREFIXES = ("utm_", "ref_", "mc_")
 NON_SOURCE_EXTENSIONS = {

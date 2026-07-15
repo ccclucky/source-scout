@@ -1,9 +1,9 @@
 ---
-name: authoritative-source-discovery
+name: source-scout
 description: Discover public official documentation and its directly cited authoritative sources from a supplied seed URL while reducing irrelevant noise. Use when a user wants a traceable documentation source set for NotebookLM or another downstream tool.
 ---
 
-# Authoritative Source Discovery
+# Source Scout
 
 ## Quick start
 

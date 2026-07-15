@@ -1,10 +1,10 @@
 {
-  "name": "authoritative-source-discovery",
+  "name": "source-scout",
   "version": "0.1.0",
   "description": "Discover and organize official or directly referenced web sources while reducing irrelevant noise.",
   "skills": "./skills/",
   "interface": {
-    "displayName": "Authoritative Source Discovery",
+    "displayName": "Source Scout",
     "shortDescription": "Discover and classify authoritative web sources.",
     "longDescription": "Find official and directly referenced sources from a seed URL, reduce noise with bounded LLM review, and export an auditable URL collection."
   }

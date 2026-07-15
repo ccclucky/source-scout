@@ -1,4 +1,4 @@
-# Authoritative Source Discovery
+# Source Scout
 
 Cross-agent skill and Python helper for discovering, classifying, and exporting official or directly referenced web sources from a seed URL.
 
@@ -19,6 +19,6 @@ python scripts/discover.py export --run-dir <RUN_DIR>
 
 ## Status
 
-- LangGraph Python smoke run: 33 URLs discovered and classified.
-- Python Tutorial smoke run: 17 URLs discovered; robots and retry behavior verified.
-- Python tests: 19 passing.
+- LangGraph Python smoke run: discovery converged with 36 fetched pages.
+- Python Tutorial smoke run: discovery converged with 17 fetched pages.
+- Python tests: 26 passing.

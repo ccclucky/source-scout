@@ -3,5 +3,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 output/
-authoritative-source-discovery-workspace/
+source-scout-workspace/
 *.log
